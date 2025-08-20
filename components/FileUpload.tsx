@@ -6,7 +6,6 @@ import { Button } from "./ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui/collapsible";
 import { ScrollArea } from "./ui/scroll-area";
 import { GherkinScenario, FileUpload as FileUploadType, FileType, AnalysisResult } from '../types';
-import { compareScenarios } from '../lib/utils';
 
 interface FileUploadProps {
   title: string;

@@ -94,7 +94,7 @@ export const ComparisonOutput: React.FC<ComparisonOutputProps> = ({
                       No missing scenarios found! 🎉
                     </motion.p>
                   ) : (
-                    missing.map((scenario, index) => (
+                    missing.map((scenario: GherkinScenario, index: number) => (
                       <motion.div
                         key={index}
                         initial={{ opacity: 0, x: -20 }}
@@ -104,7 +104,7 @@ export const ComparisonOutput: React.FC<ComparisonOutputProps> = ({
                       >
                         <h4 className="font-medium text-red-800 mb-2">{scenario.title}</h4>
                         <div className="space-y-1">
-                          {scenario.steps.map((step, stepIndex) => (
+                          {scenario.steps.map((step: string, stepIndex: number) => (
                             <p key={stepIndex} className="text-sm text-red-700">
                               {step}
                             </p>
@@ -112,7 +112,7 @@ export const ComparisonOutput: React.FC<ComparisonOutputProps> = ({
                         </div>
                         {scenario.tags && (
                           <div className="flex gap-1 mt-2">
-                            {scenario.tags.map((tag, tagIndex) => (
+                            {scenario.tags.map((tag: string, tagIndex: number) => (
                               <span
                                 key={tagIndex}
                                 className="px-2 py-1 text-xs bg-red-100 text-red-700 rounded-full"
@@ -143,7 +143,7 @@ export const ComparisonOutput: React.FC<ComparisonOutputProps> = ({
                       No overlapping scenarios found
                     </motion.p>
                   ) : (
-                    overlap.map((scenario, index) => (
+                    overlap.map((scenario: GherkinScenario, index: number) => (
                       <motion.div
                         key={index}
                         initial={{ opacity: 0, x: -20 }}
@@ -153,7 +153,7 @@ export const ComparisonOutput: React.FC<ComparisonOutputProps> = ({
                       >
                         <h4 className="font-medium text-green-800 mb-2">{scenario.title}</h4>
                         <div className="space-y-1">
-                          {scenario.steps.map((step, stepIndex) => (
+                          {scenario.steps.map((step: string, stepIndex: number) => (
                             <p key={stepIndex} className="text-sm text-green-700">
                               {step}
                             </p>
@@ -161,7 +161,7 @@ export const ComparisonOutput: React.FC<ComparisonOutputProps> = ({
                         </div>
                         {scenario.tags && (
                           <div className="flex gap-1 mt-2">
-                            {scenario.tags.map((tag, tagIndex) => (
+                            {scenario.tags.map((tag: string, tagIndex: number) => (
                               <span
                                 key={tagIndex}
                                 className="px-2 py-1 text-xs bg-green-100 text-green-700 rounded-full"
@@ -192,7 +192,7 @@ export const ComparisonOutput: React.FC<ComparisonOutputProps> = ({
                       No edge cases found
                     </motion.p>
                   ) : (
-                    edgeCases.map((scenario, index) => (
+                    edgeCases.map((scenario: GherkinScenario, index: number) => (
                       <motion.div
                         key={index}
                         initial={{ opacity: 0, x: -20 }}
@@ -202,7 +202,7 @@ export const ComparisonOutput: React.FC<ComparisonOutputProps> = ({
                       >
                         <h4 className="font-medium text-yellow-800 mb-2">{scenario.title}</h4>
                         <div className="space-y-1">
-                          {scenario.steps.map((step, stepIndex) => (
+                          {scenario.steps.map((step: string, stepIndex: number) => (
                             <p key={stepIndex} className="text-sm text-yellow-700">
                               {step}
                             </p>
@@ -210,7 +210,7 @@ export const ComparisonOutput: React.FC<ComparisonOutputProps> = ({
                         </div>
                         {scenario.tags && (
                           <div className="flex gap-1 mt-2">
-                            {scenario.tags.map((tag, tagIndex) => (
+                            {scenario.tags.map((tag: string, tagIndex: number) => (
                               <span
                                 key={tagIndex}
                                 className="px-2 py-1 text-xs bg-yellow-100 text-yellow-700 rounded-full"

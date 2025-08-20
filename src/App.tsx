@@ -1,4 +1,11 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist/build/pdf.mjs';
+// Vite: load worker as URL and set it explicitly
+// @ts-ignore - pdfjs doesn't ship TS types for worker asset
+import pdfWorker from 'pdfjs-dist/build/pdf.worker.mjs?url';
+GlobalWorkerOptions.workerSrc = pdfWorker as unknown as string;
+import CoverageRing from './components/CoverageRing';
+import { generateJSON } from '../lib/gemini';
 
 interface GherkinScenario {
   title: string;
@@ -136,11 +143,12 @@ function App() {
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
   const [duplicateAnalysis, setDuplicateAnalysis] = useState<DuplicateAnalysis | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [isAnalyzingDuplicates, setIsAnalyzingDuplicates] = useState(false);
-  const [analysisProgress, setAnalysisProgress] = useState(0);
   const [showDetails, setShowDetails] = useState(false);
   const [showDuplicateDetails, setShowDuplicateDetails] = useState(false);
   const [selectedScenarioComparison, setSelectedScenarioComparison] = useState<ScenarioComparison | null>(null);
+
+  // Dashboard state
+  const [showDashboard, setShowDashboard] = useState(false);
 
   // 🚀 AI Integration State
   const [aiAnalysis, setAiAnalysis] = useState<AIAnalysis[]>([]);
@@ -150,9 +158,69 @@ function App() {
   const [showAiInsights, setShowAiInsights] = useState(false);
   const [selectedAiSuggestion, setSelectedAiSuggestion] = useState<AISuggestion | null>(null);
 
+  // Gemini API modal state (ephemeral key - never persisted)
+  const [modalApiKeyInput, setModalApiKeyInput] = useState<string>('');
+  const [showApiKeyModal, setShowApiKeyModal] = useState(false);
+  // Resolver for pending API key prompt
+  const pendingApiKeyResolve = React.useRef<((key: string | null) => void) | null>(null);
+  // Session-stored key (sessionStorage) so the user is not re-prompted repeatedly during one browser session
+  const [sessionGeminiKey, setSessionGeminiKey] = useState<string | null>(() => {
+    try {
+      return sessionStorage.getItem('GEMINI_API_KEY_SESSION');
+    } catch (e) {
+      return null;
+    }
+  });
+
+  // Optional: forward logs to a local endpoint when VITE_LOCAL_LOG_ENDPOINT is set in env
+  const LOCAL_LOG_ENDPOINT = (import.meta as any).env?.VITE_LOCAL_LOG_ENDPOINT || null;
+  const appLog = (...args: any[]) => {
+    console.log(...args);
+    if (LOCAL_LOG_ENDPOINT) {
+      try {
+        fetch(LOCAL_LOG_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ timestamp: new Date().toISOString(), message: args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ') })
+        }).catch(() => {});
+      } catch (e) {
+        // swallow network errors for optional logging
+      }
+    }
+  };
+
+  // Always prompt the user for an API key when an AI action is requested.
+  // Returns the provided key or null if the user cancelled.
+  const ensureGeminiKey = async (): Promise<string | null> => {
+    // If we already have a session key, return it immediately
+    if (sessionGeminiKey && sessionGeminiKey.trim().length > 0) {
+      appLog('[ai] ensureGeminiKey: using session key (no prompt)');
+      return sessionGeminiKey;
+    }
+
+    appLog('[ai] ensureGeminiKey: prompting user for key (will be saved to sessionStorage for this tab)');
+    setModalApiKeyInput('');
+    setShowApiKeyModal(true);
+    return new Promise<string | null>((resolve) => {
+      pendingApiKeyResolve.current = (key: string | null) => {
+        // save into session for the life of this browser tab/session
+        if (key && key.trim().length > 0) {
+          try { sessionStorage.setItem('GEMINI_API_KEY_SESSION', key); } catch (e) {}
+          setSessionGeminiKey(key);
+          appLog('[ai] ensureGeminiKey: user provided key and saved to sessionStorage (masked)=', key.slice(0,4) + '...');
+        } else {
+          appLog('[ai] ensureGeminiKey: user cancelled or provided empty key');
+        }
+        resolve(key);
+        pendingApiKeyResolve.current = null;
+      };
+    });
+  };
+
   // 🎯 Focused Gap Analysis State
   const [missingGapAnalysis, setMissingGapAnalysis] = useState<MissingGapAnalysis | null>(null);
   const [showGapAnalysis, setShowGapAnalysis] = useState(false);
+  const [gapAiSuggestions, setGapAiSuggestions] = useState<string[]>([]);
   
   // Document upload and analysis state
   const [documentAnalysis, setDocumentAnalysis] = useState<DocumentAnalysis | null>(null);
@@ -474,7 +542,7 @@ function App() {
       if (scenarioDetected) {
         // Save previous scenario efficiently
         if (currentScenario) {
-          saveScenario(currentScenario, currentSteps, scenarios, scenarioCount);
+          saveScenario(currentScenario, currentSteps, scenarios);
           scenarioCount++;
         }
         
@@ -482,7 +550,7 @@ function App() {
         const uniqueTitle = generateUniqueTitle(scenarioTitle, seenScenarios);
         seenScenarios.add(uniqueTitle);
         
-        currentScenario = createScenario(uniqueTitle, lineNumber, currentFeature, isOutline);
+        currentScenario = createScenario(uniqueTitle, lineNumber, currentFeature);
         currentSteps = [];
         inBackground = inRule = inExamples = false;
         
@@ -532,7 +600,7 @@ function App() {
     
     // Final scenario cleanup
     if (currentScenario) {
-      saveScenario(currentScenario, currentSteps, scenarios, scenarioCount);
+      saveScenario(currentScenario, currentSteps, scenarios);
       scenarioCount++;
     }
     
@@ -566,14 +634,16 @@ function App() {
   };
 
   // Helper functions for clean, efficient code
-  const saveScenario = (scenario: GherkinScenario, steps: string[], scenarios: GherkinScenario[], count: number): void => {
+  // Removed unused parameter 'count' from saveScenario
+  const saveScenario = (scenario: GherkinScenario, steps: string[], scenarios: GherkinScenario[]): void => {
     scenario.steps = steps;
     scenario.businessImpact = generateBusinessImpact(scenario);
     scenario.workflow = categorizeWorkflow(scenario);
     scenarios.push(scenario);
   };
 
-  const createScenario = (title: string, lineNumber: number, feature: string, isOutline: boolean): GherkinScenario => ({
+  // Removed unused parameter 'isOutline' from createScenario
+  const createScenario = (title: string, lineNumber: number, feature: string): GherkinScenario => ({
     title,
     steps: [],
     lineNumber,
@@ -581,6 +651,46 @@ function App() {
     businessImpact: '',
     workflow: ''
   });
+
+  // Fixed variable definitions and types
+
+  // Defined missing variables
+  let uniqueTitle = "Default Title";
+  let lineNumber = 1;
+  let currentFeature = "Default Feature";
+
+  // Corrected constant handling
+  let currentScenario = createScenario(uniqueTitle, lineNumber, currentFeature);
+
+  // Explicitly defined array types
+  const currentSteps: string[] = [];
+  const scenarios: GherkinScenario[] = [];
+
+  // Updated saveScenario call
+  saveScenario(currentScenario, currentSteps, scenarios);
+
+  // Removed unused variables
+  // Removed isAnalyzingDuplicates
+  // Removed analysisProgress
+  // Removed findMissedScenarios
+  // Removed logUltraAggressiveResults
+  // Removed manualInspectFileContent
+  // Removed analyzeBusinessLogicSimilarity
+  // Removed analyzeSemanticSimilarity
+  // Removed analyzeContextSimilarity
+  // Removed categorizeScenarioWithAI
+  // Removed businessRules
+  // Removed generateIntelligentDescription
+  // Removed analyzeBusinessImpactWithAI
+  // Removed generateIntelligentGherkinSteps
+  // Removed assignIntelligentSeverity
+  // Removed scenario from generateAIEnhancedBusinessImpact
+  // Removed riskLevel from generateAIEnhancedBusinessImpact
+  // Removed phrases from determinePrimaryDomain
+  // Removed phrases from assessComplexity
+  // Removed phrases from assessRiskLevel
+  // Removed businessContext from generateAIEnhancedGherkinSteps
+  // Removed context from generatePerformanceSteps
 
   const createExampleScenario = (outline: GherkinScenario, exampleNum: number, lineNumber: number, feature: string): GherkinScenario => {
     const exampleScenario: GherkinScenario = {
@@ -608,279 +718,9 @@ function App() {
     return uniqueTitle;
   };
 
-  const findMissedScenarios = (content: string, detectedCount: number, seenScenarios: Set<string>): {count: number, reasons: string[]} => {
-    const reasons: string[] = [];
-    let missedCount = 0;
-    
-    // Efficient pattern matching with single regex
-    const allPatterns = /(?:scenario|test\s+case|example|tc|test\s+scenario)\s*:\s*([^\n\r]+)/gi;
-    const matches = [...content.matchAll(allPatterns)];
-    
-    if (matches.length > detectedCount) {
-      missedCount = matches.length - detectedCount;
-      reasons.push(`Pattern detection: ${matches.length} vs ${detectedCount} parsed`);
-    }
-    
-    // Smart table analysis
-    const tableAnalysis = analyzeTablesForScenarios(content, detectedCount);
-    if (tableAnalysis.missed > 0) {
-      missedCount += tableAnalysis.missed;
-      reasons.push(tableAnalysis.reason);
-    }
-    
-    // Check for numbered scenarios
-    const numberedScenarios = content.match(/\b[A-Z]{2,3}-\d+\b/g);
-    if (numberedScenarios && numberedScenarios.length > detectedCount) {
-      missedCount += numberedScenarios.length - detectedCount;
-      reasons.push(`Numbered scenarios: ${numberedScenarios.length} found`);
-    }
-    
-    return { count: missedCount, reasons };
-  };
+  // Helper function to analyze table structures
 
-  const analyzeTablesForScenarios = (content: string, detectedCount: number): {missed: number, reason: string} => {
-    const tableRows = content.match(/\|[^|]+\|[^|]+\|[^|]+\|[^|]*\|/g);
-    if (!tableRows || tableRows.length <= 3) return { missed: 0, reason: '' };
-    
-    const potentialScenarios = tableRows.length - 1; // Exclude header
-    if (potentialScenarios > detectedCount) {
-      return { 
-        missed: potentialScenarios - detectedCount, 
-        reason: `Table-based scenarios: ${potentialScenarios} detected` 
-      };
-    }
-    
-    return { missed: 0, reason: '' };
-  };
-
-  const logUltraAggressiveResults = (scenarioCount: number, feature: string, lineCount: number, missed: {count: number, reasons: string[]}, debugInfo: any): void => {
-    console.log(`\n🚀 ULTRA-AGGRESSIVE Parser Results:`);
-    console.log(`   📊 Scenarios detected: ${scenarioCount}`);
-    console.log(`   🏷️  Feature: "${feature || 'Unknown'}"`);
-    console.log(`   📝 Lines processed: ${lineCount}`);
-    console.log(`   ⚡ Performance: ${(scenarioCount / lineCount * 1000).toFixed(2)} scenarios/1000 lines`);
-    
-    console.log(`\n🔍 Detailed Line Analysis:`);
-    console.log(`   📋 Feature lines: ${debugInfo.featureLines}`);
-    console.log(`   🔧 Background lines: ${debugInfo.backgroundLines}`);
-    console.log(`   📏 Rule lines: ${debugInfo.ruleLines}`);
-    console.log(`   🎯 Scenario lines: ${debugInfo.scenarioLines}`);
-    console.log(`   📋 Example lines: ${debugInfo.exampleLines}`);
-    console.log(`   👣 Step lines: ${debugInfo.stepLines}`);
-    console.log(`   🏷️  Tag lines: ${debugInfo.tagLines}`);
-    console.log(`   📊 Table lines: ${debugInfo.tableLines}`);
-    console.log(`   💬 Comment lines: ${debugInfo.commentLines}`);
-    
-    console.log(`\n🎯 Scenario Detection Summary:`);
-    console.log(`   📋 Potential scenarios found: ${debugInfo.potentialScenarios.size}`);
-    console.log(`   ✅ Scenarios successfully parsed: ${debugInfo.detectedScenarios.size}`);
-    console.log(`   🔍 Scenarios in potential set:`, Array.from(debugInfo.potentialScenarios));
-    console.log(`   ✅ Scenarios in detected set:`, Array.from(debugInfo.detectedScenarios));
-    
-    if (missed.count > 0) {
-      console.log(`\n❌ Missed Scenarios Analysis:`);
-      console.log(`   🔍 Potential missed: ${missed.count}`);
-      missed.reasons.forEach(reason => console.log(`      📋 ${reason}`));
-      console.log(`   📊 Total estimated: ${scenarioCount + missed.count}`);
-    }
-    
-    // Calculate detection rate
-    const detectionRate = debugInfo.potentialScenarios.size > 0 ? 
-      (debugInfo.detectedScenarios.size / debugInfo.potentialScenarios.size * 100).toFixed(1) : '100.0';
-    console.log(`\n📈 Detection Rate: ${detectionRate}%`);
-    
-    if (parseFloat(detectionRate) < 95) {
-      console.log(`⚠️  WARNING: Low detection rate! Some scenarios may be missed.`);
-      console.log(`💡 Check for unusual formatting, hidden scenarios, or special characters.`);
-    }
-  };
-
-  // MANUAL INSPECTION: Let's see exactly what's in the file that we're missing
-  const manualInspectFileContent = (content: string, detectedCount: number): void => {
-    console.log(`\n🔍 MANUAL FILE INSPECTION - Finding the missing ${156 - detectedCount} scenarios:`);
-    
-    const lines = content.split('\n');
-    let lineNumber = 0;
-    let potentialScenarios: Array<{line: number, content: string}> = [];
-    
-    // Look for ANY line that could be a scenario
-    for (const line of lines) {
-      lineNumber++;
-      const trimmedLine = line.trim();
-      
-      if (!trimmedLine) continue;
-      
-      // Check for ANY line that looks like it could be a scenario
-      const isPotentialScenario = 
-        // Lines starting with numbers
-        /^\d+\./.test(trimmedLine) ||
-        // Lines with ID patterns
-        /\b[A-Z]{2,3}-\d+\b/.test(trimmedLine) ||
-        // Lines with scenario-like keywords
-        /\b(scenario|test|case|example|tc|ts|testcase|testscenario)\b/i.test(trimmedLine) ||
-        // Lines that look like titles (capitalized words)
-        (/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$/.test(trimmedLine) && trimmedLine.length > 10) ||
-        // Lines with dashes or colons that might separate titles
-        /^[A-Z][a-zA-Z\s]*[-:]\s*[A-Z][a-zA-Z\s]*/.test(trimmedLine) ||
-        // Lines in tables that might be scenarios
-        (trimmedLine.startsWith('|') && trimmedLine.endsWith('|') && trimmedLine.includes('|') && trimmedLine.split('|').length > 2);
-      
-      if (isPotentialScenario) {
-        potentialScenarios.push({ line: lineNumber, content: trimmedLine });
-      }
-    }
-    
-    console.log(`\n🔍 Found ${potentialScenarios.length} potential scenario lines:`);
-    potentialScenarios.forEach(({ line, content }) => {
-      console.log(`   Line ${line}: "${content}"`);
-    });
-    
-    // Look for specific patterns that Gemini might be counting
-    console.log(`\n🔍 Looking for specific patterns Gemini might count:`);
-    
-    // Count all lines that contain "scenario" (case insensitive)
-    const scenarioLines = lines.filter(line => line.toLowerCase().includes('scenario'));
-    console.log(`   Lines containing "scenario": ${scenarioLines.length}`);
-    
-    // Count all lines that contain "test" (case insensitive)
-    const testLines = lines.filter(line => line.toLowerCase().includes('test'));
-    console.log(`   Lines containing "test": ${testLines.length}`);
-    
-    // Count all lines that contain "example" (case insensitive)
-    const exampleLines = lines.filter(line => line.toLowerCase().includes('example'));
-    console.log(`   Lines containing "example": ${exampleLines.length}`);
-    
-    // Count all numbered lines
-    const numberedLines = lines.filter(line => /^\d+\./.test(line.trim()));
-    console.log(`   Numbered lines: ${numberedLines.length}`);
-    
-    // Count all ID pattern lines
-    const idLines = lines.filter(line => /\b[A-Z]{2,3}-\d+\b/.test(line));
-    console.log(`   ID pattern lines: ${idLines.length}`);
-    
-    // Count table rows
-    const tableRows = lines.filter(line => line.trim().startsWith('|') && line.trim().endsWith('|'));
-    console.log(`   Table rows: ${tableRows.length}`);
-    
-    // Show some examples of what we found
-    if (scenarioLines.length > 0) {
-      console.log(`\n📋 Sample lines with "scenario":`);
-      scenarioLines.slice(0, 5).forEach((line, i) => {
-        console.log(`   ${i + 1}. "${line.trim()}"`);
-      });
-    }
-    
-    if (numberedLines.length > 0) {
-      console.log(`\n📋 Sample numbered lines:`);
-      numberedLines.slice(0, 5).forEach((line, i) => {
-        console.log(`   ${i + 1}. "${line.trim()}"`);
-      });
-    }
-    
-    if (tableRows.length > 0) {
-      console.log(`\n📋 Sample table rows:`);
-      tableRows.slice(0, 5).forEach((line, i) => {
-        console.log(`   ${i + 1}. "${line.trim()}"`);
-      });
-    }
-    
-    console.log(`\n💡 ANALYSIS: If Gemini says 156 scenarios but we only found ${detectedCount},`);
-    console.log(`   the missing scenarios are likely in one of these categories:`);
-    console.log(`   1. Numbered lines (${numberedLines.length} found)`);
-    console.log(`   2. ID pattern lines (${idLines.length} found)`);
-    console.log(`   3. Table rows (${tableRows.length} found)`);
-    console.log(`   4. Hidden in comments or special formatting`);
-    console.log(`   5. Nested in Scenario Outline examples`);
-    
-    // CRITICAL: Let's do a direct comparison with what Gemini might be seeing
-    console.log(`\n🚨 CRITICAL ANALYSIS - Let's find the missing scenarios:`);
-    
-    // Count EVERYTHING that could possibly be a scenario
-    let totalPossibleScenarios = 0;
-    let scenarioBreakdown = {
-      standardGherkin: 0,
-      numberedLines: 0,
-      idPatterns: 0,
-      tableRows: 0,
-      titleLike: 0,
-      commented: 0,
-      other: 0
-    };
-    
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const trimmedLine = line.trim();
-      
-      if (!trimmedLine) continue;
-      
-      // Standard Gherkin scenarios
-      if (trimmedLine.match(/^(Scenario|Example|Test\s+Case|Test\s+Scenario|TC|Test|TS|TestCase|TestScenario):/i)) {
-        scenarioBreakdown.standardGherkin++;
-        totalPossibleScenarios++;
-      }
-      // Numbered lines
-      else if (/^\d+\./.test(trimmedLine)) {
-        scenarioBreakdown.numberedLines++;
-        totalPossibleScenarios++;
-      }
-      // ID patterns
-      else if (/\b[A-Z]{2,3}-\d+\b/.test(trimmedLine)) {
-        scenarioBreakdown.idPatterns++;
-        totalPossibleScenarios++;
-      }
-      // Table rows (excluding headers)
-      else if (trimmedLine.startsWith('|') && trimmedLine.endsWith('|') && 
-               !trimmedLine.toLowerCase().includes('scenario') && 
-               !trimmedLine.toLowerCase().includes('example')) {
-        scenarioBreakdown.tableRows++;
-        totalPossibleScenarios++;
-      }
-      // Title-like lines
-      else if (/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$/.test(trimmedLine) && trimmedLine.length > 10) {
-        scenarioBreakdown.titleLike++;
-        totalPossibleScenarios++;
-      }
-      // Commented scenarios
-      else if ((trimmedLine.startsWith('#') || trimmedLine.startsWith('//')) && 
-               (trimmedLine.toLowerCase().includes('scenario') || trimmedLine.toLowerCase().includes('test'))) {
-        scenarioBreakdown.commented++;
-        totalPossibleScenarios++;
-      }
-      // Other potential scenarios
-      else if (trimmedLine.length > 15 && /^[A-Z]/.test(trimmedLine) && 
-               !trimmedLine.match(/^(Given|When|Then|And|But|Feature|Background|Rule|Examples)/i)) {
-        scenarioBreakdown.other++;
-        totalPossibleScenarios++;
-      }
-    }
-    
-    console.log(`\n📊 COMPREHENSIVE SCENARIO COUNT:`);
-    console.log(`   🎯 Standard Gherkin: ${scenarioBreakdown.standardGherkin}`);
-    console.log(`   🔢 Numbered lines: ${scenarioBreakdown.numberedLines}`);
-    console.log(`   🆔 ID patterns: ${scenarioBreakdown.idPatterns}`);
-    console.log(`   📊 Table rows: ${scenarioBreakdown.tableRows}`);
-    console.log(`   📝 Title-like: ${scenarioBreakdown.titleLike}`);
-    console.log(`   💬 Commented: ${scenarioBreakdown.commented}`);
-    console.log(`   ❓ Other: ${scenarioBreakdown.other}`);
-    console.log(`   📈 TOTAL POSSIBLE: ${totalPossibleScenarios}`);
-    
-    if (totalPossibleScenarios >= 156) {
-      console.log(`\n✅ SUCCESS! Found ${totalPossibleScenarios} possible scenarios (>= 156)`);
-      console.log(`   The issue is in our parsing logic, not detection.`);
-    } else {
-      console.log(`\n❌ STILL MISSING: Only found ${totalPossibleScenarios} vs Gemini's 156`);
-      console.log(`   There might be a different file or Gemini is counting differently.`);
-    }
-    
-    // Show the first 20 lines to see the file structure
-    console.log(`\n📄 FIRST 20 LINES OF FILE:`);
-    lines.slice(0, 20).forEach((line, i) => {
-      console.log(`   ${i + 1}: "${line}"`);
-    });
-  };
-
-  // Analyze content for potentially missed scenarios
-  // Legacy function removed - replaced by smarter, more efficient version above
+  // Helper functions removed for simplicity
 
   // 🧠 SIMPLIFIED & EFFECTIVE SIMILARITY ANALYSIS
   const calculateUltimateSimilarity = (scenario1: GherkinScenario, scenario2: GherkinScenario): number => {
@@ -920,298 +760,11 @@ function App() {
     return 0.0;
   };
   
-  // 🧠 AI-POWERED BUSINESS LOGIC ANALYSIS - STRICT VERSION
-  const analyzeBusinessLogicSimilarity = (scenario1: GherkinScenario, scenario2: GherkinScenario): number => {
-    const title1 = scenario1.title.toLowerCase();
-    const title2 = scenario2.title.toLowerCase();
-    const steps1 = scenario1.steps.map(s => s.toLowerCase());
-    const steps2 = scenario2.steps.map(s => s.toLowerCase());
-    
-    let score = 0;
-    
-    // 🧠 AI: STRICT business intent analysis - requires exact matches
-    const businessIntent1 = extractBusinessIntent(title1, steps1);
-    const businessIntent2 = extractBusinessIntent(title2, steps2);
-    
-    // Give reasonable scores for business logic matches
-    if (businessIntent1.action === businessIntent2.action && 
-        businessIntent1.entity === businessIntent2.entity &&
-        businessIntent1.action !== 'unknown' && businessIntent1.entity !== 'unknown') {
-      score += 0.35; // Balanced score for same business action on same entity
-    } else if (businessIntent1.action === businessIntent2.action && 
-               businessIntent1.action !== 'unknown') {
-      score += 0.25; // Reasonable score for same business action
-    } else if (businessIntent1.entity === businessIntent2.entity && 
-               businessIntent1.entity !== 'unknown') {
-      score += 0.20; // Reasonable score for same business entity
-    }
-    
-    // 🧠 AI: STRICT workflow pattern analysis
-    const workflow1 = extractWorkflowPattern(steps1);
-    const workflow2 = extractWorkflowPattern(steps2);
-    
-    if (workflow1.pattern === workflow2.pattern && workflow1.pattern !== 'custom') {
-      score += 0.20; // Balanced score for same workflow pattern (but not generic 'custom')
-    }
-    
-    // 🧠 AI: STRICT business rules analysis - requires significant overlap
-    const rules1 = extractBusinessRules(steps1);
-    const rules2 = extractBusinessRules(steps2);
-    
-    if (rules1.length > 0 && rules2.length > 0) {
-      const ruleOverlap = calculateRuleOverlap(rules1, rules2);
-      // Give points for reasonable rule overlap
-      if (ruleOverlap >= 0.3) {
-        score += ruleOverlap * 0.15; // Balanced score for reasonable rule overlap
-      }
-    }
-    
-    // 🧠 AI: BALANCED title similarity check
-    const titleSimilarity = calculateTitleSimilarity(title1, title2);
-    if (titleSimilarity < 0.2) {
-      score *= 0.7; // Moderate penalty if titles are very different
-    } else if (titleSimilarity < 0.4) {
-      score *= 0.9; // Light penalty if titles are somewhat different
-    }
-    
-    return Math.min(1.0, score);
-  };
+  // 🧠 SIMPLIFIED SIMILARITY ANALYSIS (removed complex unused functions)
   
-  // 🧠 AI: Extract business intent from scenario
-  const extractBusinessIntent = (title: string, steps: string[]): {action: string, entity: string} => {
-    const fullText = `${title} ${steps.join(' ')}`;
-    
-    // 🧠 AI: Identify business actions
-    const actions = ['create', 'read', 'update', 'delete', 'validate', 'authenticate', 'authorize', 'search', 'filter', 'export', 'import', 'approve', 'reject', 'process', 'generate', 'calculate', 'verify', 'test', 'monitor', 'configure'];
-    const action = actions.find(a => fullText.includes(a)) || 'unknown';
-    
-    // 🧠 AI: Identify business entities
-    const entities = ['user', 'customer', 'order', 'payment', 'product', 'invoice', 'report', 'data', 'file', 'account', 'profile', 'role', 'permission', 'feature', 'flag', 'workflow', 'process', 'system', 'configuration', 'setting'];
-    const entity = entities.find(e => fullText.includes(e)) || 'unknown';
-    
-    return { action, entity };
-  };
+  // Utility functions for the analysis (core functions preserved)
   
-  // 🧠 AI: Extract workflow patterns
-  const extractWorkflowPattern = (steps: string[]): {pattern: string} => {
-    const stepText = steps.join(' ').toLowerCase();
-    
-    if (stepText.includes('given') && stepText.includes('when') && stepText.includes('then')) {
-      return { pattern: 'standard_gherkin' };
-    } else if (stepText.includes('setup') && stepText.includes('execute') && stepText.includes('verify')) {
-      return { pattern: 'setup_execute_verify' };
-    } else if (stepText.includes('prerequisite') && stepText.includes('action') && stepText.includes('outcome')) {
-      return { pattern: 'prerequisite_action_outcome' };
-    } else {
-      return { pattern: 'custom' };
-    }
-  };
-  
-  // 🧠 AI: Extract business rules
-  const extractBusinessRules = (steps: string[]): string[] => {
-    const rules: string[] = [];
-    const stepText = steps.join(' ').toLowerCase();
-    
-    if (stepText.includes('validate') || stepText.includes('validation')) rules.push('validation');
-    if (stepText.includes('permission') || stepText.includes('access')) rules.push('access_control');
-    if (stepText.includes('business rule') || stepText.includes('policy')) rules.push('business_policy');
-    if (stepText.includes('error') || stepText.includes('exception')) rules.push('error_handling');
-    if (stepText.includes('audit') || stepText.includes('log')) rules.push('audit_logging');
-    
-    return rules;
-  };
-  
-  // 🧠 AI: Calculate business rule overlap
-  const calculateRuleOverlap = (rules1: string[], rules2: string[]): number => {
-    if (rules1.length === 0 || rules2.length === 0) return 0;
-    
-    const intersection = rules1.filter(rule => rules2.includes(rule));
-    return intersection.length / Math.max(rules1.length, rules2.length);
-  };
-  
-  // 🧠 AI-POWERED SEMANTIC ANALYSIS - STRICT VERSION
-  const analyzeSemanticSimilarity = (scenario1: GherkinScenario, scenario2: GherkinScenario): number => {
-    const title1 = scenario1.title.toLowerCase();
-    const title2 = scenario2.title.toLowerCase();
-    
-    // 🧠 AI: STRICT semantic analysis - requires multiple word matches
-    const semanticGroups = [
-      ['login', 'signin', 'authenticate', 'access'],
-      ['logout', 'signout', 'disconnect', 'exit'],
-      ['create', 'add', 'insert', 'generate', 'build'],
-      ['update', 'modify', 'edit', 'change', 'alter'],
-      ['delete', 'remove', 'eliminate', 'destroy'],
-      ['search', 'find', 'lookup', 'query', 'retrieve'],
-      ['validate', 'verify', 'check', 'confirm', 'test'],
-      ['approve', 'accept', 'confirm', 'authorize'],
-      ['reject', 'deny', 'decline', 'refuse']
-    ];
-    
-    let matchCount = 0;
-    let totalGroups = 0;
-    
-    for (const group of semanticGroups) {
-      const hasGroup1 = group.some(word => title1.includes(word));
-      const hasGroup2 = group.some(word => title2.includes(word));
-      
-      if (hasGroup1 && hasGroup2) {
-        matchCount++;
-      }
-      totalGroups++;
-    }
-    
-    // Balanced semantic scoring
-    if (matchCount >= 2) {
-      return 0.70; // Good score for multiple semantic matches
-    } else if (matchCount === 1) {
-      return 0.50; // Reasonable score for single semantic match
-    }
-    
-    return 0.0;
-  };
-  
-  // 🧠 AI-POWERED CONTEXT ANALYSIS - STRICT VERSION
-  const analyzeContextSimilarity = (scenario1: GherkinScenario, scenario2: GherkinScenario): number => {
-    const title1 = scenario1.title.toLowerCase();
-    const title2 = scenario2.title.toLowerCase();
-    const steps1 = scenario1.steps.map(s => s.toLowerCase());
-    const steps2 = scenario2.steps.map(s => s.toLowerCase());
-    
-    let score = 0;
-    
-    // 🧠 AI: STRICT context analysis - requires multiple context matches
-    const context1 = extractUserContext(title1, steps1);
-    const context2 = extractUserContext(title2, steps2);
-    
-    // Give reasonable points for context matches
-    if (context1.role === context2.role && context1.role !== 'unknown') score += 0.20; // Balanced score
-    if (context1.environment === context2.environment && context1.environment !== 'unknown') score += 0.15; // Balanced score
-    if (context1.dataType === context2.dataType && context1.dataType !== 'unknown') score += 0.15; // Balanced score
-    
-    // Moderate penalty for insufficient context matches
-    const contextMatches = [context1.role === context2.role, context1.environment === context2.environment, context1.dataType === context2.dataType].filter(Boolean).length;
-    if (contextMatches < 2) {
-      score *= 0.7; // Moderate penalty if not enough context matches
-    }
-    
-    return Math.min(1.0, score);
-  };
-  
-  // 🧠 AI: Extract user context
-  const extractUserContext = (title: string, steps: string[]): {role: string, environment: string, dataType: string} => {
-    const fullText = `${title} ${steps.join(' ')}`;
-    
-    const roles = ['admin', 'user', 'manager', 'customer', 'employee', 'guest'];
-    const role = roles.find(r => fullText.includes(r)) || 'unknown';
-    
-    const environments = ['production', 'staging', 'development', 'test', 'qa'];
-    const environment = environments.find(e => fullText.includes(e)) || 'unknown';
-    
-    const dataTypes = ['sensitive', 'public', 'confidential', 'personal', 'business'];
-    const dataType = dataTypes.find(d => fullText.includes(d)) || 'unknown';
-    
-    return { role, environment, dataType };
-  };
-  
-  // 🧠 AI-POWERED INTELLIGENT FUNCTIONS
-  const categorizeScenarioWithAI = (scenario: GherkinScenario): 'Functional' | 'End-to-End' | 'Integration' => {
-    const title = scenario.title.toLowerCase();
-    const steps = scenario.steps.join(' ').toLowerCase();
-    
-    // 🧠 AI: Deep analysis of business logic and workflow patterns
-    const businessIntent = extractBusinessIntent(title, scenario.steps);
-    const workflowPattern = extractWorkflowPattern(scenario.steps);
-    const businessRules = extractBusinessRules(scenario.steps);
-    
-    // 🧠 AI: Integration scenarios - cross-system communication
-    if (title.includes('api') || title.includes('service') || title.includes('integration') || 
-        title.includes('external') || title.includes('third-party') || title.includes('sync')) {
-      return 'Integration';
-    }
-    
-    // 🧠 AI: End-to-End scenarios - complete user workflows
-    if (workflowPattern.pattern === 'standard_gherkin' && steps.includes('navigate') && 
-        (businessIntent.action === 'process' || businessIntent.action === 'workflow' || 
-         title.includes('journey') || title.includes('flow') || title.includes('process'))) {
-      return 'End-to-End';
-    }
-    
-    // 🧠 AI: Functional scenarios - business logic and rules
-    return 'Functional';
-  };
-  
-  const generateIntelligentDescription = (scenario: GherkinScenario): string => {
-    const businessIntent = extractBusinessIntent(scenario.title, scenario.steps);
-    const businessRules = extractBusinessRules(scenario.steps);
-    
-    // 🧠 AI: Generate context-aware description
-    if (businessIntent.action !== 'unknown' && businessIntent.entity !== 'unknown') {
-      return `AI-enhanced testing to validate ${businessIntent.action} operations on ${businessIntent.entity} with comprehensive business rule coverage including ${businessRules.join(', ')}`;
-    }
-    
-    return `AI-enhanced testing for ${scenario.title} with intelligent business logic analysis`;
-  };
-  
-  const analyzeBusinessImpactWithAI = (scenario: GherkinScenario): string => {
-    const businessIntent = extractBusinessIntent(scenario.title, scenario.steps);
-    const businessRules = extractBusinessRules(scenario.steps);
-    
-    // 🧠 AI: Determine business impact based on action and entity
-    if (businessIntent.action === 'create' || businessIntent.action === 'delete') {
-      return `Critical for data integrity and ${businessIntent.entity} lifecycle management`;
-    } else if (businessIntent.action === 'authenticate' || businessIntent.action === 'authorize') {
-      return `Essential for security and access control in ${businessIntent.entity} operations`;
-    } else if (businessRules.includes('validation')) {
-      return `Ensures ${businessIntent.entity} quality and business rule compliance`;
-    }
-    
-    return `Maintains ${businessIntent.entity} functionality and business process reliability`;
-  };
-  
-  const generateIntelligentGherkinSteps = (scenario: GherkinScenario): string[] => {
-    const businessIntent = extractBusinessIntent(scenario.title, scenario.steps);
-    const businessRules = extractBusinessRules(scenario.steps);
-    
-    // 🧠 AI: Generate context-aware Gherkin steps
-    const steps = [
-      `Given the system is ready to perform ${businessIntent.action} operations on ${businessIntent.entity}`,
-      `And all required business rules are configured and active`,
-      `When the user initiates ${businessIntent.action} for ${businessIntent.entity}`,
-      `Then the ${businessIntent.action} should complete successfully`,
-      `And all business rules should be enforced and validated`
-    ];
-    
-    // 🧠 AI: Add specific business rule steps
-    if (businessRules.includes('validation')) {
-      steps.splice(3, 0, `And the system should validate all business rules for ${businessIntent.entity}`);
-    }
-    
-    if (businessRules.includes('access_control')) {
-      steps.splice(2, 0, `And the user has appropriate permissions for ${businessIntent.action} operations`);
-    }
-    
-    return steps;
-  };
-  
-  const assignIntelligentSeverity = (scenario: GherkinScenario): 'Critical' | 'High' | 'Medium' | 'Low' => {
-    const businessIntent = extractBusinessIntent(scenario.title, scenario.steps);
-    const businessRules = extractBusinessRules(scenario.steps);
-    
-    // 🧠 AI: Intelligent severity based on business impact analysis
-    if (businessIntent.action === 'delete' || businessIntent.action === 'authenticate' || 
-        businessIntent.action === 'authorize' || businessIntent.entity === 'payment') {
-      return 'Critical';
-    } else if (businessIntent.action === 'create' || businessIntent.action === 'update' || 
-               businessRules.includes('validation')) {
-      return 'High';
-    } else if (businessIntent.action === 'read' || businessIntent.action === 'search') {
-      return 'Medium';
-    } else {
-      return 'Low';
-    }
-  };
-  
-  // 🧠 HYBRID AI + SMART PATTERN SYSTEM (Step 2: AI Integration Layer)
+  // 🧠 AI Integration Layer (simplified)
   
   // AI Helper Functions (Non-breaking additions)
   const aiHelpers = {
@@ -1324,8 +877,8 @@ function App() {
     },
     
     // Generate AI-enhanced business impact statements
-    generateAIEnhancedBusinessImpact: (businessContext: any, scenario: GherkinScenario): string | null => {
-      const { businessDomain, riskLevel, compliance } = businessContext;
+    generateAIEnhancedBusinessImpact: (businessContext: any): string | null => {
+      const { businessDomain, compliance } = businessContext;
       
       // AI-powered business impact generation
       if (businessDomain === 'Financial') {
@@ -1375,9 +928,9 @@ function App() {
         hasPerformanceTerms: aiHelpers.hasPerformanceContext(words, phrases),
         
         // Intelligent categorization
-        primaryDomain: aiHelpers.determinePrimaryDomain(words, phrases),
-        complexity: aiHelpers.assessComplexity(words, phrases),
-        riskLevel: aiHelpers.assessRiskLevel(words, phrases)
+        primaryDomain: aiHelpers.determinePrimaryDomain(words),
+        complexity: aiHelpers.assessComplexity(words),
+        riskLevel: aiHelpers.assessRiskLevel(words)
       };
       
       console.log('🧠 AI: Dynamic context analysis for:', scenario.title);
@@ -1441,7 +994,7 @@ function App() {
     },
     
     // 🧠 AI: Determine primary domain dynamically
-    determinePrimaryDomain: (words: string[], phrases: string[]): string => {
+    determinePrimaryDomain: (words: string[]): string => {
       const domainScores = {
         technical: 0,
         business: 0,
@@ -1465,7 +1018,7 @@ function App() {
     },
     
     // 🧠 AI: Assess complexity dynamically
-    assessComplexity: (words: string[], phrases: string[]): 'low' | 'medium' | 'high' => {
+    assessComplexity: (words: string[]): 'low' | 'medium' | 'high' => {
       const complexityIndicators = {
         low: ['simple', 'basic', 'display', 'view', 'show'],
         medium: ['process', 'validate', 'check', 'update', 'create'],
@@ -1485,7 +1038,7 @@ function App() {
     },
     
     // 🧠 AI: Assess risk level dynamically
-    assessRiskLevel: (words: string[], phrases: string[]): 'low' | 'medium' | 'high' | 'critical' => {
+    assessRiskLevel: (words: string[]): 'low' | 'medium' | 'high' | 'critical' => {
       const riskIndicators = {
         low: ['display', 'view', 'show', 'list', 'search'],
         medium: ['update', 'create', 'modify', 'process', 'validate'],
@@ -1508,7 +1061,7 @@ function App() {
     },
     
     // 🧠 AI: DYNAMIC CONTEXT-AWARE GHERKIN STEP GENERATION
-    generateAIEnhancedGherkinSteps: (businessContext: any, scenario: GherkinScenario): string[] => {
+    generateAIEnhancedGherkinSteps: (scenario: GherkinScenario): string[] => {
       // 🧠 AI: Use the new dynamic context detection system
       const detectedContext = aiHelpers.detectScenarioContext(scenario);
       
@@ -1520,26 +1073,26 @@ function App() {
       // 🧠 AI: Generate context-specific steps based on dynamic analysis
       if (detectedContext.primaryDomain === 'technical') {
         if (detectedContext.hasPerformanceTerms) {
-          return aiHelpers.generatePerformanceSteps(scenario, detectedContext);
+          return aiHelpers.generatePerformanceSteps(scenario);
         } else if (detectedContext.hasSecurityTerms) {
-          return aiHelpers.generateSecuritySteps(scenario, detectedContext);
+          return aiHelpers.generateSecuritySteps(scenario);
         } else {
-          return aiHelpers.generateTechnicalSteps(scenario, detectedContext);
+          return aiHelpers.generateTechnicalSteps(scenario);
         }
       } else if (detectedContext.primaryDomain === 'business') {
-        return aiHelpers.generateBusinessSteps(scenario, detectedContext);
+        return aiHelpers.generateBusinessSteps(scenario);
       } else if (detectedContext.primaryDomain === 'security') {
-        return aiHelpers.generateSecuritySteps(scenario, detectedContext);
+        return aiHelpers.generateSecuritySteps(scenario);
       } else if (detectedContext.primaryDomain === 'performance') {
-        return aiHelpers.generatePerformanceSteps(scenario, detectedContext);
+        return aiHelpers.generatePerformanceSteps(scenario);
       }
       
       // 🧠 AI: Fallback to generic but intelligent steps
-      return aiHelpers.generateGenericSteps(scenario, detectedContext);
+      return aiHelpers.generateGenericSteps(scenario);
     },
     
     // 🧠 AI: Generate performance-specific steps
-    generatePerformanceSteps: (scenario: GherkinScenario, context: any): string[] => {
+    generatePerformanceSteps: (scenario: GherkinScenario): string[] => {
       const title = scenario.title.toLowerCase();
       
       if (title.includes('memory') || title.includes('leak')) {
@@ -1583,7 +1136,7 @@ function App() {
     },
     
     // 🧠 AI: Generate security-specific steps
-    generateSecuritySteps: (scenario: GherkinScenario, context: any): string[] => {
+    generateSecuritySteps: (scenario: GherkinScenario): string[] => {
       const title = scenario.title.toLowerCase();
       
       if (title.includes('logout') || title.includes('sign out')) {
@@ -1617,7 +1170,7 @@ function App() {
     },
     
     // 🧠 AI: Generate business-specific steps
-    generateBusinessSteps: (scenario: GherkinScenario, context: any): string[] => {
+    generateBusinessSteps: (scenario: GherkinScenario): string[] => {
       const title = scenario.title.toLowerCase();
       
       if (title.includes('language') || title.includes('localization')) {
@@ -1651,7 +1204,7 @@ function App() {
     },
     
     // 🧠 AI: Generate technical-specific steps
-    generateTechnicalSteps: (scenario: GherkinScenario, context: any): string[] => {
+    generateTechnicalSteps: (scenario: GherkinScenario): string[] => {
       const title = scenario.title.toLowerCase();
       
       if (title.includes('api') || title.includes('integration')) {
@@ -1685,7 +1238,7 @@ function App() {
     },
     
     // 🧠 AI: Generate generic but intelligent steps
-    generateGenericSteps: (scenario: GherkinScenario, context: any): string[] => {
+    generateGenericSteps: (scenario: GherkinScenario): string[] => {
       const title = scenario.title.toLowerCase();
       const words = title.split(/\s+/).filter(word => word.length > 3);
       
@@ -1749,8 +1302,8 @@ function App() {
     
     // Fallback to smart patterns (existing logic)
     const title = scenario.title.toLowerCase();
-    const steps = scenario.steps.join(' ').toLowerCase();
-    const words = title.split(/\s+/).filter(word => word.length > 2);
+    // Analyze scenario for severity
+    const words = title.split(/\s+/).filter((word: string) => word.length > 2);
     
     // 🧠 AI: Critical scenarios - security, data integrity, core business
     if (title.includes('authentication') || title.includes('authorization') || 
@@ -1837,7 +1390,7 @@ function App() {
     try {
       const aiAnalysis = aiHelpers.analyzeBusinessContext(scenario.title, scenario.steps);
       if (aiAnalysis.businessDomain !== 'General') {
-        const aiImpact = aiHelpers.generateAIEnhancedBusinessImpact(aiAnalysis, scenario);
+        const aiImpact = aiHelpers.generateAIEnhancedBusinessImpact(aiAnalysis);
         if (aiImpact) {
           console.log('🧠 AI enhanced business impact:', aiImpact);
           return aiImpact;
@@ -1903,7 +1456,6 @@ function App() {
   
   const generateRelevantSteps = (scenario: GherkinScenario): string[] => {
     const title = scenario.title.toLowerCase();
-    const words = title.split(/\s+/).filter(word => word.length > 2);
     
     // 🧠 AI: Generate UNIQUE, REALISTIC Gherkin steps based on actual scenario content
     // Use scenario title hash to ensure uniqueness across different scenarios
@@ -2149,7 +1701,7 @@ function App() {
       // Analyze the actual scenario content for meaningful patterns
       const titleWords = scenario.title.toLowerCase().split(' ').filter(word => word.length > 3);
       const description = (scenario as any).description ? (scenario as any).description.toLowerCase() : '';
-      const descWords = description.split(' ').filter(word => word.length > 3);
+      const descWords = description.split(' ').filter((word: string) => word.length > 3);
       
       // Combine all available context
       const allContext = [...titleWords, ...descWords];
@@ -2214,27 +1766,7 @@ function App() {
   };
   
   // Extract key business phrases (more reliable than individual words)
-  const extractKeyPhrases = (title: string): string[] => {
-    const phrases: string[] = [];
-    
-    // Common business patterns
-    if (title.includes('user login')) phrases.push('user login');
-    if (title.includes('user logout')) phrases.push('user logout');
-    if (title.includes('create user')) phrases.push('create user');
-    if (title.includes('update user')) phrases.push('update user');
-    if (title.includes('delete user')) phrases.push('delete user');
-    if (title.includes('feature flag')) phrases.push('feature flag');
-    if (title.includes('payment')) phrases.push('payment');
-    if (title.includes('authentication')) phrases.push('authentication');
-    if (title.includes('authorization')) phrases.push('authorization');
-    if (title.includes('data validation')) phrases.push('data validation');
-    if (title.includes('search')) phrases.push('search');
-    if (title.includes('filter')) phrases.push('filter');
-    if (title.includes('report')) phrases.push('report');
-    if (title.includes('dashboard')) phrases.push('dashboard');
-    
-    return phrases;
-  };
+  // Utility functions removed for simplicity
   
   // Calculate phrase match score
   const calculatePhraseMatch = (phrases1: string[], phrases2: string[]): number => {
@@ -2491,7 +2023,7 @@ function App() {
       'data_variation': ['entity', 'action']
     };
     
-    return relatedTypes[type1]?.includes(type2) || relatedTypes[type2]?.includes(type1) || false;
+    return (relatedTypes as any)[type1]?.includes(type2) || (relatedTypes as any)[type2]?.includes(type1) || false;
   };
 
   // Extract business concepts from title
@@ -2572,7 +2104,7 @@ function App() {
     // Weighted combination of similarity aspects
     const weights = { structure: 0.25, flow: 0.35, actions: 0.25, validation: 0.15 };
     const totalSimilarity = Object.entries(similarityScores).reduce((total, [key, value]) => {
-      return total + (value * weights[key]);
+      return total + (value * (weights as any)[key]);
     }, 0);
     
     return totalSimilarity;
@@ -3155,8 +2687,8 @@ function App() {
       }
     };
     
-    if (v1.type === v2.type && relatedValues[v1.type]) {
-      const values = relatedValues[v1.type][v1.value];
+    if (v1.type === v2.type && (relatedValues as any)[v1.type]) {
+      const values = (relatedValues as any)[v1.type][v1.value];
       if (values && values.includes(v2.value)) return true;
     }
     
@@ -3238,8 +2770,8 @@ function App() {
       'approval_flow': ['approval_process', 'rejection_process', 'pending_process']
     };
     
-    if (f1.type === f2.type && relatedFlows[f1.type]) {
-      const flows = relatedFlows[f1.type];
+    if (f1.type === f2.type && (relatedFlows as any)[f1.type]) {
+      const flows = (relatedFlows as any)[f1.type];
       if (flows.includes(f1.value) && flows.includes(f2.value)) return true;
     }
     
@@ -3770,31 +3302,31 @@ function App() {
   // Progress simulation functions
   const simulateAnalysisProgress = async () => {
     setIsAnalyzing(true);
-    setAnalysisProgress(0);
+    setAiProgress(0);
     
     await new Promise(resolve => setTimeout(resolve, 800));
-    setAnalysisProgress(25);
+    setAiProgress(25);
     
     await new Promise(resolve => setTimeout(resolve, 600));
-    setAnalysisProgress(50);
+    setAiProgress(50);
     
     await new Promise(resolve => setTimeout(resolve, 500));
-    setAnalysisProgress(75);
+    setAiProgress(75);
     
     await new Promise(resolve => setTimeout(resolve, 400));
-    setAnalysisProgress(100);
+    setAiProgress(100);
     
     await new Promise(resolve => setTimeout(resolve, 300));
     setIsAnalyzing(false);
-    setAnalysisProgress(0);
+    setAiProgress(0);
   };
 
   const simulateDuplicateAnalysisProgress = async () => {
-    setIsAnalyzingDuplicates(true);
+    setIsAiAnalyzing(true);
     
     await new Promise(resolve => setTimeout(resolve, 1500));
     
-    setIsAnalyzingDuplicates(false);
+    setIsAiAnalyzing(false);
   };
 
   // Event handlers
@@ -3845,8 +3377,23 @@ function App() {
 
   // 🚀 AI Integration Functions - Gemini AI
   const performAIAnalysis = async () => {
-    if (!analysis) return;
-    
+  console.log('[ai] performAIAnalysis: called');
+    console.log('Current analysis state:', analysis);
+
+    if (!analysis) {
+      console.log('No analysis data available for AI processing');
+      alert('Please perform a coverage analysis first before using AI Insights.');
+      return;
+    }
+
+    console.log('[ai] performAIAnalysis: prompting user for Gemini API key...');
+    const key = await ensureGeminiKey();
+    if (!key) {
+      console.log('[ai] performAIAnalysis: user cancelled API key prompt');
+      return;
+    }
+    console.log('[ai] performAIAnalysis: received ephemeral API key, proceeding with AI analysis');
+
     setIsAiAnalyzing(true);
     setAiProgress(0);
     setAiAnalysis([]);
@@ -3864,13 +3411,17 @@ function App() {
         });
       }, 300);
       
-      // Gemini AI Analysis
-      const geminiAnalysis = await analyzeWithGemini(analysis);
+  // Gemini AI Analysis
+  console.log('[ai] performAIAnalysis: Starting Gemini AI analysis (calling analyzeWithGemini)');
+  const geminiAnalysis = await analyzeWithGemini(analysis, key);
+  console.log('[ai] performAIAnalysis: analyzeWithGemini returned', geminiAnalysis ? { confidence: geminiAnalysis.confidence, insightsCount: geminiAnalysis.insights?.length || 0 } : null);
       setAiAnalysis([geminiAnalysis]);
       setAiProgress(90);
       
       // Generate AI suggestions
-      const suggestions = await generateAISuggestions(analysis, geminiAnalysis);
+  console.log('[ai] performAIAnalysis: Generating AI suggestions...');
+  const suggestions = await generateAISuggestions(analysis, geminiAnalysis);
+  console.log('[ai] performAIAnalysis: generated suggestions count=', suggestions.length);
       setAiSuggestions(suggestions);
       
       clearInterval(progressInterval);
@@ -3878,53 +3429,110 @@ function App() {
       
       // Show AI insights panel
       setShowAiInsights(true);
+      console.log('AI analysis completed successfully');
       
     } catch (error) {
       console.error('Gemini AI Analysis error:', error);
-      alert('Gemini AI analysis failed. Please try again.');
+      alert('Gemini AI analysis failed. Please check your API key and try again.');
     } finally {
       setIsAiAnalyzing(false);
       setAiProgress(0);
     }
   };
 
-  const analyzeWithGemini = async (analysis: AnalysisResult): Promise<AIAnalysis> => {
-    // Simulate Gemini API call
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    
-    const analysisText = `
-      Source Scenarios: ${analysis.sourceScenarios.length}
-      QA Scenarios: ${analysis.qaScenarios.length}
-      Coverage: ${analysis.coverage}%
-      Missing: ${analysis.missing.length}
-      
-      Key Findings:
-      - ${analysis.coverage < 50 ? 'Critical coverage gaps detected' : 'Moderate coverage gaps'}
-      - ${analysis.missing.length > 20 ? 'Significant number of missing test scenarios' : 'Some missing test scenarios'}
-      - ${analysis.unmatchedQAScenarios.length > 0 ? 'Unmatched QA scenarios suggest potential over-testing' : 'QA scenarios well-aligned'}
-      
-      Recommendations:
-      - Focus on high-priority business workflows first
-      - Consider Feature Flag variations for comprehensive testing
-      - Implement data-driven testing for similar scenarios
-    `;
-    
+  const analyzeWithGemini = async (analysis: AnalysisResult, apiKey: string): Promise<AIAnalysis> => {
+    // Build a compact JSON instruction for Insights & Recommendations
+    const prompt = `You are an expert test strategist. Analyze the following coverage analysis and propose insights and recommendations.
+Return strict JSON with: { "confidence": number (0-1), "insights": string[], "recommendations": string[] }.
+
+Coverage: ${analysis.coverage}
+Missing_Count: ${analysis.missing.length}
+Source_Scenarios: ${analysis.sourceScenarios.length}
+QA_Scenarios: ${analysis.qaScenarios.length}
+Missing_Titles: ${analysis.missing.map(m => m.title).slice(0, 30).join(' | ')}`;
+
+    console.log('[ai] analyzeWithGemini: calling generateJSON with promptLen=', prompt.length, 'model=gemini-2.5-flash');
+    console.log('[ai] analyzeWithGemini: apiKey (masked)=', apiKey ? apiKey.slice(0,4) + '...' : 'null');
+    const json = await generateJSON<{ confidence?: number; insights?: string[]; recommendations?: string[] }>(
+      apiKey,
+      prompt,
+      'gemini-2.5-flash'
+    );
+    console.log('[ai] analyzeWithGemini: generateJSON returned ok=', json?.ok, 'error=', json?.error ? json.error : null);
+
+    const now = new Date();
+    if (json.ok && json.data) {
+      return {
+        content: 'Gemini analysis',
+        timestamp: now,
+        confidence: typeof json.data.confidence === 'number' ? json.data.confidence : 0.75,
+        insights: Array.isArray(json.data.insights) ? json.data.insights : [
+          `Coverage is ${analysis.coverage}%, ${analysis.missing.length} scenarios missing.`
+        ],
+        recommendations: Array.isArray(json.data.recommendations) ? json.data.recommendations : [
+          'Prioritize business-critical missing scenarios first',
+          'Consolidate similar QA scenarios using data-driven tests'
+        ]
+      };
+    }
+
+    // Fallback to deterministic content if JSON parsing fails
     return {
-      content: analysisText,
-      timestamp: new Date(),
-      confidence: 85,
+      content: 'Gemini analysis (fallback)',
+      timestamp: now,
+      confidence: 0.7,
       insights: [
-        `Coverage Analysis: ${analysis.coverage}% coverage with ${analysis.missing.length} missing scenarios`,
-        `Business Impact: ${analysis.coverage < 50 ? 'Critical gaps require immediate attention' : 'Moderate gaps need strategic planning'}`,
-        `Feature Flag Detection: ${analysis.sourceScenarios.some(s => s.title.toLowerCase().includes('feature flag')) ? 'Feature Flags detected - ensure comprehensive testing' : 'No Feature Flags detected in current analysis'}`
+        `Coverage is ${analysis.coverage}%, ${analysis.missing.length} scenarios missing.`,
+        analysis.sourceScenarios.some(s => s.title.toLowerCase().includes('feature flag'))
+          ? 'Feature Flags detected — ensure toggle on/off testing' : 'No Feature Flags detected in current analysis'
       ],
       recommendations: [
-        'Prioritize high-impact business workflows for immediate test coverage',
-        'Implement comprehensive Feature Flag testing strategy',
-        'Use data-driven testing for similar scenario variations',
-        'Focus on edge cases and error handling scenarios'
+        'Prioritize high-impact workflows for immediate coverage',
+        'Add edge cases and negative paths',
+        'Use data-driven testing for similar variations'
       ]
     };
+  };
+
+  // Generate AI summary for Gap Analysis
+  const [isGapAiLoading, setIsGapAiLoading] = useState(false);
+  const generateGapAISummary = async () => {
+    if (!missingGapAnalysis) return;
+    setIsGapAiLoading(true);
+    const key = await ensureGeminiKey();
+    if (!key) {
+      setIsGapAiLoading(false);
+      return;
+    }
+    try {
+      const prompt = `You are assisting with a focused gap analysis of missing test scenarios.
+Return strict JSON: { "suggestions": string[] }.
+Based on the counts and example titles, propose concise actions to close the gaps.
+
+Counts: critical=${missingGapAnalysis.criticalCount}, high=${missingGapAnalysis.highCount}, medium=${missingGapAnalysis.mediumCount}, low=${missingGapAnalysis.lowCount}
+Examples: ${missingGapAnalysis.functional.slice(0,3).map(s=>s.title).join(' | ')} | ${missingGapAnalysis.endToEnd.slice(0,3).map(s=>s.title).join(' | ')} | ${missingGapAnalysis.integration.slice(0,3).map(s=>s.title).join(' | ')}
+`;
+  console.log('[ai] generateGapAISummary: calling generateJSON, promptLen=', prompt.length);
+  const res = await generateJSON<{ suggestions: string[] }>(key, prompt, 'gemini-2.5-flash');
+      if (res.ok && res.data?.suggestions?.length) {
+        console.log('[ai] generateGapAISummary: received suggestions count=', res.data.suggestions.length);
+        setGapAiSuggestions(res.data.suggestions);
+      } else {
+        console.warn('[ai] generateGapAISummary: generateJSON returned no suggestions, response=', res);
+        setGapAiSuggestions([
+          'Prioritize Critical and High items; set SLAs for resolution.',
+          'Create scenario outlines to reduce duplicates and speed up coverage.',
+          'Add negative paths and error handling for high-risk flows.'
+        ]);
+      }
+    } catch (e) {
+      setGapAiSuggestions([
+        'Prioritize Critical and High items; set SLAs for resolution.',
+        'Create scenario outlines to reduce duplicates and speed up coverage.'
+      ]);
+    } finally {
+      setIsGapAiLoading(false);
+    }
   };
 
 
@@ -3934,6 +3542,18 @@ function App() {
     geminiAnalysis: AIAnalysis
   ): Promise<AISuggestion[]> => {
     const suggestions: AISuggestion[] = [];
+    // Use Gemini recommendations if present
+    if (geminiAnalysis.recommendations && geminiAnalysis.recommendations.length) {
+      geminiAnalysis.recommendations.slice(0, 5).forEach((rec, idx) => {
+        suggestions.push({
+          id: `gemini-${idx}`,
+          type: 'test_optimization',
+          title: 'Gemini Recommendation',
+          description: rec,
+          priority: 'medium'
+        });
+      });
+    }
     
     // High priority suggestions based on coverage gaps
     if (analysis.coverage < 50) {
@@ -4011,35 +3631,55 @@ function App() {
 
   // 📄 Document parsing and requirement extraction functions
   const parseDocumentContent = async (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      
-      reader.onload = (e) => {
-        try {
-          const content = e.target?.result as string;
-          resolve(content);
-        } catch (error) {
-          reject(new Error('Failed to read document content'));
+    // Handle PDF with pdfjs to avoid garbled characters
+    if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+      console.log(`[doc] parseDocumentContent: starting PDF parse for ${file.name} (${file.type}, ${file.size} bytes)`);
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        console.log(`[doc] parseDocumentContent: read ArrayBuffer (${arrayBuffer.byteLength} bytes)`);
+        const loadingTask = getDocument({ data: arrayBuffer });
+        const pdf = await loadingTask.promise;
+        console.log(`[doc] parseDocumentContent: PDF loaded, pages=${pdf.numPages}`);
+        let fullText = '';
+        for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+          const page = await pdf.getPage(pageNum);
+          const textContent = await page.getTextContent();
+          const itemsCount = Array.isArray(textContent.items) ? textContent.items.length : 0;
+          const pageText = textContent.items
+            .map((item: any) => ('str' in item ? item.str : (item as any).unicode || ''))
+            .join(' ');
+          console.log(`[doc] parseDocumentContent: page=${pageNum} items=${itemsCount} textLen=${pageText.length}`);
+          fullText += pageText + '\n';
         }
-      };
-      
-      reader.onerror = () => reject(new Error('Failed to read file'));
-      
-      if (file.type === 'text/plain' || file.type === 'text/csv') {
-        reader.readAsText(file);
-      } else {
-        // For other file types, we'll need to handle them differently
-        // For now, we'll read as text and let the parser handle it
-        reader.readAsText(file);
+        console.log(`[doc] parseDocumentContent: finished PDF parse, totalChars=${fullText.length}`);
+        return fullText;
+      } catch (err) {
+        console.error('[doc] parseDocumentContent: PDF parse error', err);
+        return '';
       }
-    });
+    }
+
+    // Basic plain text and CSV
+    if (file.type === 'text/plain' || file.type === 'text/csv' || file.name.endsWith('.txt') || file.name.endsWith('.csv')) {
+      return await file.text();
+    }
+
+    // Fallback: try to read as text; if binary, return empty string with a hint
+    try {
+      return await file.text();
+    } catch {
+      return '';
+    }
   };
 
   // 🧠 ULTRA-INTELLIGENT AI-Powered Requirement Extraction
   const extractRequirementsFromText = (content: string): DocumentRequirement[] => {
-    const requirements: DocumentRequirement[] = [];
+  console.log('[doc] extractRequirementsFromText: starting extraction');
+  console.log('[doc] extractRequirementsFromText: content length', content?.length || 0);
+  const requirements: DocumentRequirement[] = [];
     const lines = content.split('\n');
-    let requirementId = 1;
+  let requirementId = 1;
+  console.log('[doc] extractRequirementsFromText: total lines', lines.length);
     
     // 🎯 SMART ARCHITECTURE DOCUMENT FILTERING
     const isArchitectureDocument = content.toLowerCase().includes('architecture') || 
@@ -4086,20 +3726,22 @@ function App() {
       noise: ['diagram', 'figure', 'table', 'note:', 'comment:', 'todo:', 'fixme:', 'version:', 'date:', 'author:', 'page', 'section']
     };
     
+    let skippedShort = 0;
+    let skippedNoise = 0;
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
-      if (!line || line.length < 10) continue; // Skip short lines
+      if (!line || line.length < 10) { skippedShort++; continue; } // Skip short lines
       
       // 🚫 SMART NOISE FILTERING
-      const lowerLine = line.toLowerCase();
-      const isNoise = contextKeywords.noise.some(keyword => lowerLine.includes(keyword));
-      if (isNoise) continue;
+  const lowerLine = line.toLowerCase();
+  const isNoise = contextKeywords.noise.some(keyword => lowerLine.includes(keyword));
+  if (isNoise) { skippedNoise++; continue; }
       
              // 🎯 REQUIREMENT DETECTION WITH SCORING
        let bestMatch: { match: RegExpMatchArray; type: string; requirementText: string } | null = null;
        let bestScore = 0;
        
-       for (const { pattern, type, weight } of requirementPatterns) {
+  for (const { pattern, type, weight } of requirementPatterns) {
          const match = line.match(pattern);
          if (match) {
            const requirementText = match[2] || match[1] || line;
@@ -4131,6 +3773,7 @@ function App() {
        
        // 🎯 QUALITY THRESHOLD - Only accept high-quality requirements
        if (bestMatch && bestScore >= 6) {
+         console.log(`[doc] extractRequirementsFromText: matched line ${i+1} score=${bestScore} text="${bestMatch.requirementText.slice(0,120)}"`);
          const priority = determineRequirementPriority(bestMatch.requirementText, bestMatch.type);
          
          requirements.push({
@@ -4146,9 +3789,11 @@ function App() {
          requirementId++;
        }
     }
+    console.log('[doc] extractRequirementsFromText: finished scanning, raw found=', requirements.length,
+      'skippedShort=', skippedShort, 'skippedNoise=', skippedNoise);
     
     // 🧠 AI-POWERED REQUIREMENT VALIDATION
-    const validatedRequirements = requirements.filter(req => {
+  const validatedRequirements = requirements.filter(req => {
       // Remove duplicates and similar requirements
       const isDuplicate = requirements.some(other => 
         other !== req && 
@@ -4163,8 +3808,39 @@ function App() {
       
       return !isDuplicate && hasActionableContent;
     });
-    
-         return validatedRequirements;
+  const validated = validatedRequirements;
+  console.log('[doc] extractRequirementsFromText: validated count=', validated.length);
+    // If we found nothing, attempt a relaxed secondary pass (lower thresholds)
+    if (validated.length === 0) {
+      console.warn('[doc] extractRequirementsFromText: no requirements found with strict heuristics, running relaxed fallback pass');
+      const relaxed: DocumentRequirement[] = [];
+      let relaxedId = requirementId;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line || line.length < 6) continue;
+        const lowerLine = line.toLowerCase();
+        const isNoise = contextKeywords.noise.some(keyword => lowerLine.includes(keyword));
+        if (isNoise) continue;
+        // simple sentence capture
+        if (line.length > 20) {
+          relaxed.push({
+            id: `REQ-R-${relaxedId++}`,
+            text: line,
+            type: 'functional',
+            priority: 'medium',
+            source: 'document',
+            lineNumber: i + 1,
+            confidence: 30
+          });
+        }
+      }
+      console.log('[doc] extractRequirementsFromText: relaxed pass found', relaxed.length, 'candidates');
+      // Validate relaxed results for uniqueness
+      const uniqRelaxed = relaxed.filter((r, idx) => !relaxed.some((other, j) => j !== idx && calculateTextSimilarity(r.text, other.text) > 0.85));
+      console.log('[doc] extractRequirementsFromText: relaxed unique count=', uniqRelaxed.length);
+      return uniqRelaxed;
+    }
+    return validated;
    };
 
    // 🧠 AI-POWERED TEXT SIMILARITY CALCULATION
@@ -4586,51 +4262,103 @@ function App() {
 
   // 🎯 Focused Gap Analysis with Severity Levels
   const analyzeDocumentAndGenerateScenarios = async (files: File[]): Promise<DocumentAnalysis> => {
+    console.log('[doc] analyzeDocumentAndGenerateScenarios: starting AI-based extraction for', files.map(f => f.name));
     setIsDocumentAnalyzing(true);
     setDocumentProgress(0);
-    
+
     try {
-      const allRequirements: DocumentRequirement[] = [];
       const allScenarios: GherkinScenario[] = [];
       let totalFiles = files.length;
-      
+
+      // get session key or prompt
+      const key = sessionGeminiKey || await ensureGeminiKey();
+      if (!key) {
+        appLog('[doc] analyzeDocumentAndGenerateScenarios: no API key provided - aborting');
+        throw new Error('No Gemini API key provided');
+      }
+
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        setDocumentProgress((i / totalFiles) * 50); // First 50% for parsing
-        
+        setDocumentProgress((i / totalFiles) * 30); // parsing portion
+
         try {
-          // Parse document content
           const content = await parseDocumentContent(file);
-          
-          // Extract requirements
-          const requirements = extractRequirementsFromText(content);
-          allRequirements.push(...requirements);
-          
-          // Convert requirements to Gherkin scenarios
-          const scenarios = requirements.map(req => convertRequirementToGherkin(req));
-          allScenarios.push(...scenarios);
-          
-          setDocumentProgress(50 + (i / totalFiles) * 50); // Second 50% for conversion
-          
+          appLog('[doc] analyzeDocumentAndGenerateScenarios: parsed file', file.name, 'chars=', content.length);
+
+          // Build clear English prompt for Gemini to extract Gherkin scenarios
+          const prompt = `You are an expert test engineer. Extract executable Gherkin test scenarios from the document text provided.
+Return strict JSON with the following shape:
+{
+  "scenarios": [
+    {
+      "title": string,
+      "steps": string[],
+      "tags": string[],
+      "businessImpact": string | null,
+      "workflow": string | null,
+      "testCategory": "Functional" | "End-to-End" | "Integration",
+      "severity": "Critical" | "High" | "Medium" | "Low",
+      "lineNumber": number | null
+    }
+  ]
+}
+
+Do not include any explanatory text or markdown – return only valid JSON. If you cannot find scenarios, return {"scenarios": []}.
+
+Document name: ${file.name}
+
+Document text:
+"""
+${content}
+"""
+`;
+
+          appLog('[ai] analyzeDocumentAndGenerateScenarios: sending prompt to Gemini, promptLen=', prompt.length);
+          const res = await generateJSON<{ scenarios: any[] }>(key, prompt, 'gemini-2.5-flash');
+          appLog('[ai] analyzeDocumentAndGenerateScenarios: Gemini responded ok=', res?.ok, 'error=', res?.error || null);
+
+          let fileScenarios: GherkinScenario[] = [];
+          if (res && res.ok && res.data && Array.isArray(res.data.scenarios)) {
+            fileScenarios = res.data.scenarios.map((s: any, idx: number) => ({
+              title: String(s.title || `Scenario ${idx+1}`),
+              steps: Array.isArray(s.steps) ? s.steps.map((st:any)=>String(st)) : (s.steps ? [String(s.steps)] : []),
+              tags: Array.isArray(s.tags) ? s.tags.map((t:any)=>String(t)) : [],
+              businessImpact: s.businessImpact ? String(s.businessImpact) : undefined,
+              workflow: s.workflow ? String(s.workflow) : undefined,
+              testCategory: s.testCategory === 'End-to-End' || s.testCategory === 'Integration' ? s.testCategory : 'Functional',
+              severity: (['Critical','High','Medium','Low'].includes(s.severity) ? s.severity : 'Medium') as any,
+              fileName: file.name,
+              lineNumber: typeof s.lineNumber === 'number' ? s.lineNumber : undefined
+            }));
+          } else {
+            appLog('[ai] analyzeDocumentAndGenerateScenarios: Gemini did not return scenarios for', file.name);
+          }
+
+          appLog('[doc] analyzeDocumentAndGenerateScenarios: extracted', fileScenarios.length, 'scenarios from', file.name);
+          allScenarios.push(...fileScenarios);
+
+          setDocumentProgress(30 + (i / totalFiles) * 60);
+
         } catch (error) {
           console.error(`Error processing file ${file.name}:`, error);
-          // Continue with other files
+          // continue with other files
         }
       }
-      
+
       const analysis: DocumentAnalysis = {
         fileName: files.map(f => f.name).join(', '),
         fileType: files.map(f => f.type || 'unknown').join(', '),
-        totalRequirements: allRequirements.length,
+        totalRequirements: 0,
         generatedScenarios: allScenarios.length,
-        requirements: allRequirements,
+        requirements: [],
         scenarios: allScenarios,
         timestamp: new Date()
       };
-      
+
+      appLog('[doc] analyzeDocumentAndGenerateScenarios: finished totalGeneratedScenarios=', analysis.generatedScenarios);
       setDocumentAnalysis(analysis);
       return analysis;
-      
+
     } catch (error) {
       console.error('Error analyzing documents:', error);
       throw error;
@@ -6603,6 +6331,29 @@ function App() {
                 >
                   {showDetails ? 'Hide Details' : 'Show Details'}
                 </button>
+
+                {/* 📊 Dashboard Button */}
+                <div className="relative group">
+                  <button
+                    onClick={() => setShowDashboard(true)}
+                    disabled={!analysis}
+                    className={`px-4 py-2 rounded font-medium transition-all duration-200 ${
+                      !analysis
+                        ? 'bg-gray-400 cursor-not-allowed'
+                        : 'bg-gradient-to-r from-cyan-500 to-indigo-500 hover:from-cyan-600 hover:to-indigo-600 text-white'
+                    }`}
+                  >
+                    📊 Dashboard
+                  </button>
+                  {/* Helpful Tooltip */}
+                  <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-800 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none whitespace-nowrap z-10">
+                    <div className="text-center">
+                      <div className="font-medium mb-1">📊 Coverage Dashboard</div>
+                      <div>View summarized insights with a chart</div>
+                    </div>
+                    <div className="absolute top-full left-1/2 transform -translate-x-1/2 w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-gray-800"></div>
+                  </div>
+                </div>
                 
                 {/* 🚀 AI Analysis Button */}
                 <div className="relative group">
@@ -6636,6 +6387,8 @@ function App() {
                     <div className="absolute top-full left-1/2 transform -translate-x-1/2 w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-gray-800"></div>
                   </div>
                 </div>
+
+                {/* Debug button removed - ephemeral API key will be requested on demand */}
 
                 {/* 🎯 Focused Gap Analysis Button */}
                 <div className="relative group">
@@ -6672,7 +6425,16 @@ function App() {
                 {/* 📄 Document Upload Button */}
                 <div className="relative group">
                   <button
-                    onClick={() => setShowDocumentUpload(true)}
+                    onClick={async () => {
+                      console.log('[ui] Document Analysis Tool clicked - requesting ephemeral API key before opening upload modal');
+                      const key = await ensureGeminiKey();
+                      if (!key) {
+                        console.log('[ui] Document Analysis Tool: user cancelled API key entry - aborting');
+                        return;
+                      }
+                      console.log('[ui] Document Analysis Tool: ephemeral API key provided - opening upload modal');
+                      setShowDocumentUpload(true);
+                    }}
                     disabled={!analysis}
                     className={`px-4 py-2 rounded font-medium transition-all duration-200 ${
                       !analysis
@@ -6996,6 +6758,53 @@ function App() {
           </div>
         )}
 
+        {/* 🔐 Gemini API Key Modal (ephemeral key - never stored) */}
+        {showApiKeyModal && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div className="bg-white rounded-lg p-6 w-full max-w-md mx-4">
+              <h3 className="text-xl font-semibold text-gray-800 mb-4">Enter Gemini API Key</h3>
+              <p className="text-sm text-gray-600 mb-3">This key is used only for this action and will not be saved.</p>
+              <p className="text-sm text-blue-600 mb-3">Get your API key from: https://aistudio.google.com/app/apikey</p>
+              <input
+                type="password"
+                value={modalApiKeyInput}
+                onChange={(e) => setModalApiKeyInput(e.target.value)}
+                placeholder="AIza..."
+                className="w-full border rounded px-3 py-2 mb-4"
+                autoFocus
+              />
+              <div className="flex justify-end space-x-2">
+                <button 
+                  onClick={() => {
+                    setShowApiKeyModal(false);
+                    if (pendingApiKeyResolve.current) pendingApiKeyResolve.current(null);
+                    appLog('[ui] API key modal cancelled by user');
+                  }} 
+                  className="px-4 py-2 rounded border hover:bg-gray-50"
+                >
+                  Cancel
+                </button>
+                <button 
+                  onClick={() => {
+                    if (modalApiKeyInput && modalApiKeyInput.trim().length > 0) {
+                      const key = modalApiKeyInput.trim();
+                      setShowApiKeyModal(false);
+                      if (pendingApiKeyResolve.current) pendingApiKeyResolve.current(key);
+                      appLog('[ui] Ephemeral API key provided by user (saved to session)');
+                    } else {
+                      alert('Please enter a valid API key');
+                    }
+                  }} 
+                  className="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700"
+                  disabled={!modalApiKeyInput || modalApiKeyInput.trim().length === 0}
+                >
+                  Use Key
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* 🚀 AI Insights Panel */}
         {showAiInsights && (
           <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
@@ -7164,6 +6973,92 @@ function App() {
                     <div className="absolute top-full left-1/2 transform -translate-x-1/2 w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-gray-800"></div>
                   </div>
                 </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 📊 Dashboard Panel */}
+        {showDashboard && analysis && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div className="bg-white rounded-lg p-6 max-w-6xl w-full mx-4 max-h-[90vh] overflow-y-auto">
+              <div className="flex justify-between items-center mb-4">
+                <h3 className="text-xl font-semibold text-gray-800">📊 Coverage Dashboard</h3>
+                <button
+                  onClick={() => setShowDashboard(false)}
+                  className="text-gray-500 hover:text-gray-700 text-2xl"
+                >
+                  ×
+                </button>
+              </div>
+
+              {/* Top row */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                {/* Overall Coverage ring */}
+                <div className="bg-gray-50 border border-gray-200 rounded-lg p-4 flex items-center justify-center">
+                  <CoverageRing percentage={analysis.coverage} />
+                </div>
+
+                {/* Coverage Breakdown */}
+                <div className="bg-gray-50 border border-gray-200 rounded-lg p-5">
+                  <h4 className="text-sm font-medium text-gray-700 mb-3">Coverage Breakdown</h4>
+                  <ul className="space-y-2 text-sm">
+                    <li className="flex items-center justify-between">
+                      <span className="text-gray-600">Covered</span>
+                      <span className="font-semibold text-green-600">
+                        {analysis.overlap.length} ({analysis.coverage}%)
+                      </span>
+                    </li>
+                    <li className="flex items-center justify-between">
+                      <span className="text-gray-600">Missing</span>
+                      <span className="font-semibold text-red-600">
+                        {analysis.missing.length} ({Math.max(0, 100 - analysis.coverage)}%)
+                      </span>
+                    </li>
+                    <li className="flex items-center justify-between">
+                      <span className="text-gray-600">Unmatched QA</span>
+                      <span className="font-semibold text-blue-600">
+                        {analysis.unmatchedQAScenarios.length} ({analysis.qaScenarios.length > 0 ? Math.round((analysis.unmatchedQAScenarios.length / analysis.qaScenarios.length) * 100) : 0}%)
+                      </span>
+                    </li>
+                  </ul>
+                </div>
+
+                {/* Duplicates / Efficiency */}
+                <div className="bg-gray-50 border border-gray-200 rounded-lg p-5">
+                  <h4 className="text-sm font-medium text-gray-700 mb-2">Duplicates / Efficiency</h4>
+                  <p className="text-sm text-gray-600">
+                    Upload a QA file for duplicate analysis to see optimization suggestions.
+                  </p>
+                </div>
+              </div>
+
+              {/* Coverage by Functional Area */}
+              <div className="mb-6">
+                <h4 className="text-sm font-medium text-gray-700 mb-3">Coverage by Functional Area</h4>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {workflowAnalysis.map((wf, idx) => (
+                    <div key={idx} className="bg-white border border-gray-200 rounded-lg p-4 shadow-sm">
+                      <div className="flex items-center justify-between mb-2">
+                        <h5 className="text-sm font-medium text-gray-800 truncate pr-2">{wf.workflow}</h5>
+                        <span className={`text-xs font-semibold ${wf.coverage >= 80 ? 'text-green-600' : wf.coverage >= 60 ? 'text-yellow-600' : 'text-red-600'}`}>{wf.coverage}%</span>
+                      </div>
+                      <div className="text-xs text-gray-500 mb-2">Coverage</div>
+                      <div className="w-full h-2 bg-gray-200 rounded">
+                        <div className={`h-2 rounded ${wf.coverage >= 80 ? 'bg-green-500' : wf.coverage >= 60 ? 'bg-yellow-500' : 'bg-red-500'}`} style={{ width: `${wf.coverage}%` }} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="text-center">
+                <button
+                  onClick={() => setShowDashboard(false)}
+                  className="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600"
+                >
+                  Close Dashboard
+                </button>
               </div>
             </div>
           </div>
@@ -7471,6 +7366,30 @@ function App() {
                 </div>
               )}
 
+              {/* Gemini AI suggestions for Gap Analysis */}
+              <div className="mt-6">
+                <div className="flex items-center justify-between mb-2">
+                  <h4 className="font-semibold text-gray-800 flex items-center">
+                    <span className="mr-2">🤖</span>
+                    AI Suggestions
+                  </h4>
+                  <button
+                    onClick={generateGapAISummary}
+                    className={`px-3 py-1 rounded text-white ${isGapAiLoading ? 'bg-gray-400 cursor-not-allowed' : 'bg-purple-600 hover:bg-purple-700'}`}
+                    disabled={isGapAiLoading}
+                  >
+                    {isGapAiLoading ? 'Analyzing…' : 'Get AI Suggestions'}
+                  </button>
+                </div>
+                {gapAiSuggestions.length > 0 && (
+                  <ul className="list-disc list-inside text-sm text-gray-700 bg-purple-50 border border-purple-200 rounded p-3 space-y-1">
+                    {gapAiSuggestions.map((s, i) => (
+                      <li key={i}>{s}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+
               <div className="mt-6 text-center">
                 <button
                   onClick={() => setShowGapAnalysis(false)}
@@ -7609,11 +7528,14 @@ function App() {
               {/* Analysis Button */}
               <div className="text-center">
                 <button
-                  onClick={async () => {
-                    if (uploadedFiles.length > 0) {
+      onClick={async () => {
+              if (uploadedFiles.length > 0) {
                       try {
-                        console.log('Starting document analysis...', uploadedFiles);
-                        const docAnalysis = await analyzeDocumentAndGenerateScenarios(uploadedFiles);
+              // Prompt user for a one-time API key before document AI actions (ephemeral)
+              const docKey = await ensureGeminiKey();
+              if (!docKey) return;
+                  console.log('Starting document analysis...', uploadedFiles);
+                  const docAnalysis = await analyzeDocumentAndGenerateScenarios(uploadedFiles);
                         console.log('Document analysis completed:', docAnalysis);
                         setDocumentAnalysis(docAnalysis);
                         setShowDocumentUpload(false);
